@@ -6,6 +6,18 @@ This is a **Personalized Study Scheduler API** built with FastAPI that helps use
 
 Preferred communication style: Simple, everyday language.
 
+# Recent Changes
+
+## August 25, 2025
+- **Generated Complete API Documentation** (`API_Documentation.md`)
+  - Created comprehensive client reference guide with 45 endpoints
+  - Added detailed request/response examples for all endpoints  
+  - Included authentication flow, error handling, and integration examples
+  - Documented ML features: Half-Life Regression, quiz generation, learning analytics
+  - Provided JavaScript/React and Python client implementation examples
+  - Added rate limiting, file upload guidelines, and best practices
+  - Production-ready documentation for client developers
+
 # System Architecture
 
 ## Backend Framework
