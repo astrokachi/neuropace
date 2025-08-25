@@ -1,0 +1,1847 @@
+# app/services/document_processor.py
+import PyPDF2
+import pytesseract
+from PIL import Image
+import re
+from typing import List, Dict, Tuple, Optional
+from sentence_transformers import SentenceTransformer
+import numpy as np
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.cluster import KMeans
+import nltk
+from nltk.tokenize import sent_tokenize, word_tokenize
+from nltk.corpus import stopwords
+import logging
+
+# Download required NLTK data (run once)
+try:
+    nltk.download('punkt', quiet=True)
+    nltk.download('stopwords', quiet=True)
+except:
+    pass
+
+logger = logging.getLogger(__name__)
+
+class DocumentProcessor:
+    def __init__(self):
+        # Load sentence transformer for semantic analysis
+        self.sentence_model = SentenceTransformer('all-MiniLM-L6-v2')
+        self.stop_words = set(stopwords.words('english'))
+        
+    def extract_text_from_pdf(self, file_path: str) -> str:
+        """Extract text from PDF file"""
+        try:
+            with open(file_path, 'rb') as file:
+                pdf_reader = PyPDF2.PdfReader(file)
+                text = ""
+                for page in pdf_reader.pages:
+                    text += page.extract_text() + "\n"
+                return text.strip()
+        except Exception as e:
+            logger.error(f"Error extracting text from PDF: {e}")
+            return ""
+    
+    def extract_text_from_image(self, file_path: str) -> str:
+        """Extract text from image using OCR"""
+        try:
+            image = Image.open(file_path)
+            text = pytesseract.image_to_string(image)
+            return text.strip()
+        except Exception as e:
+            logger.error(f"Error extracting text from image: {e}")
+            return ""
+    
+    def clean_text(self, text: str) -> str:
+        """Clean and preprocess text"""
+        # Remove extra whitespaces and newlines
+        text = re.sub(r'\s+', ' ', text)
+        # Remove special characters but keep punctuation
+        text = re.sub(r'[^\w\s.,!?;:-]', '', text)
+        return text.strip()
+    
+    def calculate_readability_score(self, text: str) -> float:
+        """Calculate text difficulty using Flesch Reading Ease (simplified)"""
+        sentences = sent_tokenize(text)
+        words = word_tokenize(text)
+        
+        if len(sentences) == 0 or len(words) == 0:
+            return 0.5
+        
+        avg_sentence_length = len(words) / len(sentences)
+        
+        # Count syllables (simplified)
+        syllable_count = sum([self._count_syllables(word) for word in words])
+        avg_syllables_per_word = syllable_count / len(words)
+        
+        # Simplified Flesch Reading Ease formula
+        score = 206.835 - (1.015 * avg_sentence_length) - (84.6 * avg_syllables_per_word)
+        
+        # Normalize to 0-1 scale (0 = very difficult, 1 = very easy)
+        normalized_score = max(0, min(100, score)) / 100
+        return 1 - normalized_score  # Invert so higher = more difficult
+    
+    def _count_syllables(self, word: str) -> int:
+        """Simple syllable counting"""
+        word = word.lower()
+        vowels = "aeiouy"
+        syllable_count = 0
+        prev_was_vowel = False
+        
+        for char in word:
+            is_vowel = char in vowels
+            if is_vowel and not prev_was_vowel:
+                syllable_count += 1
+            prev_was_vowel = is_vowel
+        
+        # Handle silent 'e'
+        if word.endswith('e'):
+            syllable_count -= 1
+        
+        return max(1, syllable_count)
+    
+    def estimate_reading_time(self, text: str, wpm: int = 200) -> int:
+        """Estimate reading time in minutes"""
+        word_count = len(word_tokenize(text))
+        return max(1, word_count // wpm)
+    
+    def extract_keywords(self, text: str, max_keywords: int = 20) -> List[str]:
+        """Extract key terms using TF-IDF"""
+        try:
+            # Clean text and remove stop words
+            sentences = sent_tokenize(text)
+            cleaned_sentences = [
+                ' '.join([word.lower() for word in word_tokenize(sent) 
+                         if word.lower() not in self.stop_words and word.isalpha()])
+                for sent in sentences
+            ]
+            
+            if not cleaned_sentences:
+                return []
+            
+            vectorizer = TfidfVectorizer(
+                max_features=max_keywords,
+                ngram_range=(1, 2),  # Include bigrams
+                min_df=2  # Word must appear at least twice
+            )
+            
+            tfidf_matrix = vectorizer.fit_transform(cleaned_sentences)
+            feature_names = vectorizer.get_feature_names_out()
+            
+            # Get average TF-IDF scores
+            mean_scores = np.mean(tfidf_matrix.toarray(), axis=0)
+            keyword_scores = list(zip(feature_names, mean_scores))
+            keyword_scores.sort(key=lambda x: x[1], reverse=True)
+            
+            return [keyword for keyword, score in keyword_scores]
+        
+        except Exception as e:
+            logger.error(f"Error extracting keywords: {e}")
+            return []
+    
+    def segment_document(self, text: str, max_segment_length: int = 1000) -> List[Dict]:
+        """Segment document into logical sections"""
+        sentences = sent_tokenize(text)
+        segments = []
+        current_segment = ""
+        current_length = 0
+        segment_id = 0
+        
+        for sentence in sentences:
+            sentence_length = len(word_tokenize(sentence))
+            
+            if current_length + sentence_length > max_segment_length and current_segment:
+                # Save current segment
+                segments.append({
+                    'id': segment_id,
+                    'text': current_segment.strip(),
+                    'word_count': current_length,
+                    'estimated_time': max(1, current_length // 200)
+                })
+                segment_id += 1
+                current_segment = sentence
+                current_length = sentence_length
+            else:
+                current_segment += " " + sentence
+                current_length += sentence_length
+        
+        # Add final segment
+        if current_segment:
+            segments.append({
+                'id': segment_id,
+                'text': current_segment.strip(),
+                'word_count': current_length,
+                'estimated_time': max(1, current_length // 200)
+            })
+        
+        return segments
+    
+    def process_document(self, file_path: str, file_type: str) -> Dict:
+        """Main document processing pipeline"""
+        # Extract text based on file type
+        if file_type.lower() == 'pdf':
+            raw_text = self.extract_text_from_pdf(file_path)
+        elif file_type.lower() in ['png', 'jpg', 'jpeg']:
+            raw_text = self.extract_text_from_image(file_path)
+        else:
+            raise ValueError(f"Unsupported file type: {file_type}")
+        
+        if not raw_text:
+            raise ValueError("No text could be extracted from the document")
+        
+        # Clean and process text
+        cleaned_text = self.clean_text(raw_text)
+        
+        # Calculate metrics
+        word_count = len(word_tokenize(cleaned_text))
+        difficulty_score = self.calculate_readability_score(cleaned_text)
+        reading_time = self.estimate_reading_time(cleaned_text)
+        keywords = self.extract_keywords(cleaned_text)
+        segments = self.segment_document(cleaned_text)
+        
+        return {
+            'extracted_text': cleaned_text,
+            'word_count': word_count,
+            'difficulty_score': difficulty_score,
+            'estimated_reading_time': reading_time,
+            'keywords': keywords,
+            'sections': segments,
+            'processing_status': 'completed'
+        }
+
+# app/services/quiz_generator.py
+import random
+import re
+from typing import List, Dict, Tuple
+from sentence_transformers import SentenceTransformer
+import numpy as np
+from sklearn.metrics.pairwise import cosine_similarity
+from nltk.tokenize import sent_tokenize, word_tokenize
+from nltk.tag import pos_tag
+import logging
+
+logger = logging.getLogger(__name__)
+
+class QuizGenerator:
+    def __init__(self):
+        self.sentence_model = SentenceTransformer('all-MiniLM-L6-v2')
+        self.question_templates = {
+            'definition': [
+                "What is {term}?",
+                "Define {term}.",
+                "What does {term} mean?",
+            ],
+            'comprehension': [
+                "According to the text, {question}?",
+                "The text suggests that {statement}. True or False?",
+                "What is the main idea of {context}?",
+            ],
+            'application': [
+                "How would you apply {concept}?",
+                "What is an example of {concept}?",
+                "In what situation would {concept} be useful?",
+            ]
+        }
+    
+    def extract_key_sentences(self, text: str, num_sentences: int = 10) -> List[str]:
+        """Extract the most important sentences for quiz generation"""
+        sentences = sent_tokenize(text)
+        if len(sentences) <= num_sentences:
+            return sentences
+        
+        # Use sentence embeddings to find diverse, important sentences
+        embeddings = self.sentence_model.encode(sentences)
+        
+        # Calculate sentence importance based on similarity to overall text
+        text_embedding = self.sentence_model.encode([text])
+        similarities = cosine_similarity(embeddings, text_embedding).flatten()
+        
+        # Select top sentences with diversity
+        selected_indices = []
+        remaining_indices = list(range(len(sentences)))
+        
+        # First, select the most similar sentence
+        best_idx = np.argmax(similarities)
+        selected_indices.append(best_idx)
+        remaining_indices.remove(best_idx)
+        
+        # Then select diverse sentences
+        while len(selected_indices) < num_sentences and remaining_indices:
+            max_min_distance = -1
+            best_candidate = None
+            
+            for candidate_idx in remaining_indices:
+                # Calculate minimum distance to already selected sentences
+                min_distance = min([
+                    1 - cosine_similarity(
+                        [embeddings[candidate_idx]], 
+                        [embeddings[selected_idx]]
+                    )[0][0]
+                    for selected_idx in selected_indices
+                ])
+                
+                # Balance importance and diversity
+                score = 0.6 * similarities[candidate_idx] + 0.4 * min_distance
+                
+                if score > max_min_distance:
+                    max_min_distance = score
+                    best_candidate = candidate_idx
+            
+            if best_candidate is not None:
+                selected_indices.append(best_candidate)
+                remaining_indices.remove(best_candidate)
+        
+        return [sentences[i] for i in selected_indices]
+    
+    def extract_named_entities(self, sentence: str) -> List[Tuple[str, str]]:
+        """Extract potential question targets (simplified NER)"""
+        words = word_tokenize(sentence)
+        pos_tags = pos_tag(words)
+        
+        entities = []
+        current_entity = []
+        
+        for word, tag in pos_tags:
+            # Look for nouns, proper nouns, and numbers
+            if tag in ['NN', 'NNS', 'NNP', 'NNPS', 'CD']:
+                current_entity.append(word)
+            else:
+                if current_entity:
+                    entity_text = ' '.join(current_entity)
+                    if len(entity_text) > 2:  # Filter out very short entities
+                        entities.append((entity_text, 'ENTITY'))
+                    current_entity = []
+        
+        # Don't forget the last entity
+        if current_entity:
+            entity_text = ' '.join(current_entity)
+            if len(entity_text) > 2:
+                entities.append((entity_text, 'ENTITY'))
+        
+        return entities
+    
+    def generate_multiple_choice_question(self, sentence: str, context: str) -> Dict:
+        """Generate a multiple choice question from a sentence"""
+        entities = self.extract_named_entities(sentence)
+        
+        if not entities:
+            return None
+        
+        # Select a random entity to question about
+        target_entity, entity_type = random.choice(entities)
+        
+        # Create question by replacing the entity with a blank
+        question_text = sentence.replace(target_entity, "______")
+        
+        # Generate distractors (simplified approach)
+        all_entities = []
+        sentences = sent_tokenize(context)
+        for sent in sentences:
+            all_entities.extend([ent[0] for ent in self.extract_named_entities(sent)])
+        
+        # Remove duplicates and the correct answer
+        potential_distractors = list(set(all_entities))
+        if target_entity in potential_distractors:
+            potential_distractors.remove(target_entity)
+        
+        # Select 3 distractors
+        distractors = random.sample(
+            potential_distractors, 
+            min(3, len(potential_distractors))
+        )
+        
+        # Create options
+        options = [target_entity] + distractors
+        random.shuffle(options)
+        
+        # Find correct answer index
+        correct_answer = chr(65 + options.index(target_entity))  # A, B, C, D
+        
+        return {
+            'question_text': f"Fill in the blank: {question_text}",
+            'question_type': 'multiple_choice',
+            'options': [f"{chr(65+i)}) {option}" for i, option in enumerate(options)],
+            'correct_answer': correct_answer,
+            'explanation': f"The correct answer is '{target_entity}' based on the context provided.",
+            'difficulty': self._calculate_question_difficulty(sentence, target_entity),
+            'source_section': sentence[:50] + "..."
+        }
+    
+    def generate_true_false_question(self, sentence: str) -> Dict:
+        """Generate a true/false question"""
+        # Simple approach: create a false statement by negating or changing key terms
+        words = word_tokenize(sentence)
+        
+        # Find verbs to potentially negate
+        pos_tags = pos_tag(words)
+        verbs = [word for word, tag in pos_tags if tag.startswith('VB')]
+        
+        if verbs and random.choice([True, False]):  # 50% chance to create false statement
+            # Create false statement by negating
+            verb_to_negate = random.choice(verbs)
+            false_sentence = sentence.replace(verb_to_negate, f"does not {verb_to_negate}")
+            correct_answer = "False"
+            statement = false_sentence
+        else:
+            # Keep original statement (true)
+            correct_answer = "True"
+            statement = sentence
+        
+        return {
+            'question_text': f"True or False: {statement}",
+            'question_type': 'true_false',
+            'options': ["True", "False"],
+            'correct_answer': correct_answer,
+            'explanation': f"This statement is {correct_answer.lower()} based on the source material.",
+            'difficulty': self._calculate_question_difficulty(sentence),
+            'source_section': sentence[:50] + "..."
+        }
+    
+    def generate_comprehension_question(self, sentences: List[str]) -> Dict:
+        """Generate a comprehension question from multiple sentences"""
+        if len(sentences) < 2:
+            return None
+        
+        # Select a context (2-3 sentences)
+        start_idx = random.randint(0, max(0, len(sentences) - 3))
+        context_sentences = sentences[start_idx:start_idx + 3]
+        context = " ".join(context_sentences)
+        
+        # Extract key concepts
+        entities = []
+        for sent in context_sentences:
+            entities.extend(self.extract_named_entities(sent))
+        
+        if not entities:
+            return None
+        
+        # Create a "what" or "why" question
+        question_templates = [
+            f"Based on the passage, what can be concluded about {entities[0][0]}?",
+            f"According to the text, why is {entities[0][0]} important?",
+            f"What is the relationship between the concepts mentioned?",
+            f"What is the main point of this passage?"
+        ]
+        
+        question_text = random.choice(question_templates)
+        
+        # For comprehension questions, we'll use the first sentence as the "correct" concept
+        correct_concept = entities[0][0] if entities else "the main concept"
+        
+        return {
+            'question_text': question_text,
+            'question_type': 'comprehension',
+            'options': [],  # Open-ended or could add multiple choice later
+            'correct_answer': correct_concept,
+            'explanation': f"The passage discusses {correct_concept} and its significance.",
+            'difficulty': 0.7,  # Comprehension questions are generally harder
+            'source_section': context[:100] + "..."
+        }
+    
+    def _calculate_question_difficulty(self, source_text: str, target_entity: str = None) -> float:
+        """Calculate question difficulty based on various factors"""
+        base_difficulty = 0.5
+        
+        # Longer sentences are generally harder
+        word_count = len(word_tokenize(source_text))
+        if word_count > 20:
+            base_difficulty += 0.1
+        elif word_count > 30:
+            base_difficulty += 0.2
+        
+        # Technical terms increase difficulty
+        if target_entity and len(target_entity.split()) > 1:
+            base_difficulty += 0.1
+        
+        # Complex sentence structure increases difficulty
+        if source_text.count(',') > 2:
+            base_difficulty += 0.1
+        
+        return min(1.0, base_difficulty)
+    
+    def generate_quiz(self, text: str, num_questions: int = 10) -> Dict:
+        """Generate a complete quiz from text"""
+        try:
+            # Extract key sentences
+            key_sentences = self.extract_key_sentences(text, num_sentences=15)
+            
+            if not key_sentences:
+                raise ValueError("No suitable sentences found for quiz generation")
+            
+            questions = []
+            question_types = ['multiple_choice', 'true_false', 'comprehension']
+            
+            attempts = 0
+            max_attempts = num_questions * 3
+            
+            while len(questions) < num_questions and attempts < max_attempts:
+                attempts += 1
+                
+                # Randomly select question type
+                question_type = random.choice(question_types)
+                
+                try:
+                    if question_type == 'multiple_choice':
+                        sentence = random.choice(key_sentences)
+                        question = self.generate_multiple_choice_question(sentence, text)
+                    elif question_type == 'true_false':
+                        sentence = random.choice(key_sentences)
+                        question = self.generate_true_false_question(sentence)
+                    elif question_type == 'comprehension':
+                        question = self.generate_comprehension_question(key_sentences)
+                    
+                    if question and question not in questions:
+                        questions.append(question)
+                
+                except Exception as e:
+                    logger.warning(f"Failed to generate {question_type} question: {e}")
+                    continue
+            
+            if not questions:
+                raise ValueError("Could not generate any questions from the text")
+            
+            # Calculate overall quiz difficulty
+            avg_difficulty = np.mean([q['difficulty'] for q in questions])
+            
+            return {
+                'questions': questions,
+                'total_questions': len(questions),
+                'estimated_duration': len(questions) * 2,  # 2 minutes per question
+                'difficulty_level': avg_difficulty,
+                'generated_at': 'now'  # Will be replaced with actual timestamp
+            }
+        
+        except Exception as e:
+            logger.error(f"Error generating quiz: {e}")
+            raise ValueError(f"Quiz generation failed: {str(e)}")
+
+# app/services/spaced_repetition.py
+import math
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional, Tuple
+import numpy as np
+from dataclasses import dataclass
+import logging
+
+logger = logging.getLogger(__name__)
+
+@dataclass
+class ReviewData:
+    performance_score: float  # 0-1 scale
+    response_time: float  # in seconds
+    difficulty_rating: Optional[float] = None  # User's perceived difficulty
+    timestamp: datetime = None
+
+class SpacedRepetitionScheduler:
+    """
+    Implements a hybrid spaced repetition algorithm inspired by:
+    - Duolingo's Half-Life Regression (HLR)
+    - SuperMemo SM-2 algorithm
+    - Forgetting curve principles
+    """
+    
+    def __init__(self):
+        # HLR parameters
+        self.initial_strength = 0.5
+        self.initial_half_life = 1.0  # days
+        self.max_half_life = 30.0  # days
+        self.min_half_life = 0.1  # days
+        
+        # Performance thresholds
+        self.mastery_threshold = 0.8
+        self.difficulty_threshold = 0.6
+        self.failure_threshold = 0.4
+        
+        # Cognitive load parameters
+        self.max_daily_reviews = 20
+        self.max_cognitive_load = 0.8
+        
+    def calculate_memory_strength(self, 
+                                 current_strength: float,
+                                 half_life: float, 
+                                 days_elapsed: float) -> float:
+        """Calculate current memory strength using exponential decay"""
+        if days_elapsed <= 0:
+            return current_strength
+        
+        decay_factor = math.pow(0.5, days_elapsed / half_life)
+        return current_strength * decay_factor
+    
+    def update_half_life(self, 
+                        current_half_life: float,
+                        performance_score: float,
+                        difficulty_factor: float = 1.0) -> float:
+        """Update half-life based on performance using HLR principles"""
+        
+        # Base multiplier based on performance
+        if performance_score >= self.mastery_threshold:
+            # Excellent performance - significantly increase half-life
+            multiplier = 2.0 + (performance_score - 0.8) * 2.0
+        elif performance_score >= self.difficulty_threshold:
+            # Good performance - moderate increase
+            multiplier = 1.5 + (performance_score - 0.6) * 1.0
+        elif performance_score >= self.failure_threshold:
+            # Poor performance - slight decrease
+            multiplier = 0.8 + (performance_score - 0.4) * 1.0
+        else:
+            # Very poor performance - significant decrease
+            multiplier = 0.5 + performance_score * 0.6
+        
+        # Adjust for difficulty
+        multiplier *= (2.0 - difficulty_factor)  # Higher difficulty = lower multiplier
+        
+        # Calculate new half-life
+        new_half_life = current_half_life * multiplier
+        
+        # Apply bounds
+        return max(self.min_half_life, min(self.max_half_life, new_half_life))
+    
+    def calculate_retention_probability(self, 
+                                      strength: float, 
+                                      half_life: float, 
+                                      days_since_last_review: float) -> float:
+        """Calculate the probability of remembering the material"""
+        current_strength = self.calculate_memory_strength(strength, half_life, days_since_last_review)
+        # Convert strength to retention probability (sigmoid function)
+        return 1 / (1 + math.exp(-10 * (current_strength - 0.5)))
+    
+    def calculate_urgency_score(self, 
+                               retention_prob: float,
+                               difficulty_score: float,
+                               days_overdue: float = 0) -> float:
+        """Calculate how urgently an item needs to be reviewed"""
+        base_urgency = 1 - retention_prob  # Lower retention = higher urgency
+        
+        # Increase urgency for difficult items that are being forgotten
+        difficulty_bonus = difficulty_score * (1 - retention_prob) * 0.5
+        
+        # Penalty for overdue items
+        overdue_penalty = min(1.0, days_overdue * 0.1)
+        
+        urgency = base_urgency + difficulty_bonus + overdue_penalty
+        return min(1.0, urgency)
+    
+    def calculate_cognitive_load(self, 
+                               document_difficulty: float,
+                               estimated_duration: int,
+                               user_fatigue_factor: float = 0.0) -> float:
+        """Calculate cognitive load for a study session"""
+        # Base load from document difficulty
+        base_load = document_difficulty
+        
+        # Time factor (longer sessions = higher load)
+        time_factor = min(1.0, estimated_duration / 60.0)  # Normalize to 60 minutes
+        
+        # User fatigue
+        fatigue_factor = user_fatigue_factor
+        
+        total_load = (base_load * 0.6) + (time_factor * 0.3) + (fatigue_factor * 0.1)
+        return min(1.0, total_load)
+    
+    def get_optimal_review_time(self, 
+                              strength: float,
+                              half_life: float,
+                              target_retention: float = 0.8) -> float:
+        """Calculate optimal time for next review to maintain target retention"""
+        if strength <= 0:
+            return 0.1  # Review immediately
+        
+        # Solve for days when retention drops to target level
+        # target_retention = strength * 0.5^(days/half_life)
+        # days = half_life * log2(target_retention/strength)
+        
+        if target_retention >= strength:
+            return 0.1  # Review immediately if we can't reach target
+        
+        ratio = target_retention / strength
+        if ratio <= 0:
+            return 0.1
+        
+        days = half_life * math.log2(ratio) * -1  # Negative because ratio < 1
+        return max(0.1, min(self.max_half_life, days))
+    
+    def update_schedule_after_review(self, 
+                                   current_schedule_data: Dict,
+                                   review_data: ReviewData) -> Dict:
+        """Update scheduling parameters after a review session"""
+        
+        # Extract current data
+        current_strength = current_schedule_data.get('strength', self.initial_strength)
+        current_half_life = current_schedule_data.get('half_life', self.initial_half_life)
+        last_review = current_schedule_data.get('last_review_date')
+        difficulty_score = current_schedule_data.get('difficulty_score', 0.5)
+        repetition_number = current_schedule_data.get('repetition_number', 0)
+        
+        # Calculate days since last review
+        if last_review and review_data.timestamp:
+            days_elapsed = (review_data.timestamp - last_review).total_seconds() / 86400
+        else:
+            days_elapsed = 1.0
+        
+        # Calculate memory strength at time of review
+        strength_at_review = self.calculate_memory_strength(
+            current_strength, current_half_life, days_elapsed
+        )
+        
+        # Update half-life based on performance
+        user_difficulty = review_data.difficulty_rating or difficulty_score
+        new_half_life = self.update_half_life(
+            current_half_life, 
+            review_data.performance_score,
+            user_difficulty
+        )
+        
+        # Update strength based on review outcome
+        if review_data.performance_score >= self.mastery_threshold:
+            # Successful review - boost strength
+            strength_boost = 0.2 + (review_data.performance_score - 0.8) * 0.5
+            new_strength = min(1.0, strength_at_review + strength_boost)
+        elif review_data.performance_score >= self.failure_threshold:
+            # Partial success - moderate boost
+            strength_boost = 0.1 + (review_data.performance_score - 0.4) * 0.25
+            new_strength = min(1.0, strength_at_review + strength_boost)
+        else:
+            # Poor performance - reset to lower strength
+            new_strength = max(0.1, strength_at_review * 0.5)
+        
+        # Calculate next review date
+        optimal_days = self.get_optimal_review_time(new_strength, new_half_life)
+        next_review_date = datetime.now() + timedelta(days=optimal_days)
+        
+        # Update cognitive load based on performance and response time
+        cognitive_load = self.calculate_cognitive_load(
+            difficulty_score,
+            30,  # Assume 30 minute default session
+            0.1 if review_data.performance_score < 0.6 else 0.0
+        )
+        
+        return {
+            'strength': new_strength,
+            'half_life': new_half_life,
+            'next_review_date': next_review_date,
+            'last_review_date': review_data.timestamp or datetime.now(),
+            'repetition_number': repetition_number + 1,
+            'cognitive_load_score': cognitive_load,
+            'retention_probability': self.calculate_retention_probability(
+                new_strength, new_half_life, 0
+            ),
+            'urgency_score': 0.0  # Just reviewed, so urgency is low
+        }
+    
+    def generate_daily_schedule(self, 
+                              user_documents: List[Dict],
+                              max_items: Optional[int] = None) -> List[Dict]:
+        """Generate optimal daily study schedule"""
+        max_items = max_items or self.max_daily_reviews
+        
+        # Calculate current status for each document
+        candidates = []
+        current_time = datetime.now()
+        
+        for doc_data in user_documents:
+            schedule_data = doc_data.get('schedule_data', {})
+            
+            # Skip if not due yet
+            next_review = schedule_data.get('next_review_date')
+            if next_review and next_review > current_time:
+                continue
+            
+            # Calculate current retention and urgency
+            strength = schedule_data.get('strength', self.initial_strength)
+            half_life = schedule_data.get('half_life', self.initial_half_life)
+            last_review = schedule_data.get('last_review_date')
+            
+            if last_review:
+                days_since_review = (current_time - last_review).total_seconds() / 86400
+            else:
+                days_since_review = 999  # Never reviewed
+            
+            retention_prob = self.calculate_retention_probability(
+                strength, half_life, days_since_review
+            )
+            
+            days_overdue = 0
+            if next_review:
+                days_overdue = max(0, (current_time - next_review).total_seconds() / 86400)
+            
+            urgency = self.calculate_urgency_score(
+                retention_prob,
+                doc_data.get('difficulty_score', 0.5),
+                days_overdue
+            )
+            
+            # Calculate cognitive load
+            cognitive_load = self.calculate_cognitive_load(
+                doc_data.get('difficulty_score', 0.5),
+                doc_data.get('estimated_reading_time', 30),
+                0.0  # Base fatigue
+            )
+            
+            candidates.append({
+                'document_id': doc_data['id'],
+                'title': doc_data.get('title', 'Unknown'),
+                'urgency_score': urgency,
+                'retention_probability': retention_prob,
+                'cognitive_load': cognitive_load,
+                'estimated_duration': doc_data.get('estimated_reading_time', 30),
+                'difficulty_score': doc_data.get('difficulty_score', 0.5),
+                'days_overdue': days_overdue,
+                'activity_type': self._determine_activity_type(retention_prob, urgency)
+            })
+        
+        # Sort by priority (urgency score, then retention probability)
+        candidates.sort(key=lambda x: (-x['urgency_score'], x['retention_probability']))
+        
+        # Select items while managing cognitive load
+        selected_items = []
+        total_cognitive_load = 0.0
+        total_time = 0
+        
+        for candidate in candidates:
+            if len(selected_items) >= max_items:
+                break
+            
+            # Check if adding this item would exceed cognitive load limits
+            new_load = total_cognitive_load + candidate['cognitive_load']
+            new_time = total_time + candidate['estimated_duration']
+            
+            # Skip if it would cause cognitive overload or exceed time limits
+            if (new_load > self.max_cognitive_load and len(selected_items) > 0) or new_time > 180:  # 3 hours max
+                continue
+            
+            selected_items.append(candidate)
+            total_cognitive_load = new_load
+            total_time = new_time
+        
+        # Add priority and scheduling metadata
+        for i, item in enumerate(selected_items):
+            item['priority'] = 5 - min(4, i)  # First items get highest priority
+            item['recommended_time_slot'] = self._get_optimal_time_slot(
+                item['difficulty_score'], 
+                item['cognitive_load']
+            )
+        
+        return selected_items
+    
+    def _determine_activity_type(self, retention_prob: float, urgency_score: float) -> str:
+        """Determine what type of activity is most appropriate"""
+        if retention_prob < 0.3:
+            return "re_learn"  # Material largely forgotten
+        elif retention_prob < 0.6:
+            return "review"    # Needs reinforcement
+        elif urgency_score > 0.7:
+            return "quiz"      # Test retention
+        else:
+            return "light_review"  # Maintenance
+    
+    def _get_optimal_time_slot(self, difficulty: float, cognitive_load: float) -> str:
+        """Recommend optimal time of day based on difficulty and cognitive load"""
+        if difficulty > 0.7 or cognitive_load > 0.7:
+            return "morning"    # High difficulty = peak mental energy
+        elif difficulty > 0.4:
+            return "afternoon"  # Moderate difficulty
+        else:
+            return "evening"    # Light review can be done anytime
+    
+    def get_performance_analytics(self, user_progress_data: List[Dict]) -> Dict:
+        """Analyze user performance patterns for optimization"""
+        if not user_progress_data:
+            return {}
+        
+        analytics = {
+            'total_documents': len(user_progress_data),
+            'avg_retention_rate': 0.0,
+            'learning_efficiency': 0.0,
+            'difficulty_distribution': {'easy': 0, 'medium': 0, 'hard': 0},
+            'performance_trend': 'stable',
+            'recommendations': []
+        }
+        
+        # Calculate averages
+        retention_rates = []
+        quiz_scores = []
+        study_times = []
+        
+        for progress in user_progress_data:
+            if progress.get('retention_rate'):
+                retention_rates.append(progress['retention_rate'])
+            if progress.get('average_quiz_score'):
+                quiz_scores.append(progress['average_quiz_score'])
+            if progress.get('total_reading_time'):
+                study_times.append(progress['total_reading_time'])
+            
+            # Categorize difficulty
+            difficulty = progress.get('difficulty_rating', 0.5)
+            if difficulty < 0.4:
+                analytics['difficulty_distribution']['easy'] += 1
+            elif difficulty < 0.7:
+                analytics['difficulty_distribution']['medium'] += 1
+            else:
+                analytics['difficulty_distribution']['hard'] += 1
+        
+        if retention_rates:
+            analytics['avg_retention_rate'] = np.mean(retention_rates)
+        
+        if quiz_scores and study_times:
+            # Learning efficiency = performance / time invested
+            total_performance = sum(quiz_scores) / len(quiz_scores)
+            total_time_hours = sum(study_times) / 3600  # Convert to hours
+            analytics['learning_efficiency'] = total_performance / max(1, total_time_hours)
+        
+        # Generate recommendations
+        if analytics['avg_retention_rate'] < 0.6:
+            analytics['recommendations'].append("Consider shorter review intervals")
+        
+        if analytics['learning_efficiency'] < 0.1:
+            analytics['recommendations'].append("Focus on active recall techniques")
+        
+        hard_percentage = analytics['difficulty_distribution']['hard'] / max(1, analytics['total_documents'])
+        if hard_percentage > 0.6:
+            analytics['recommendations'].append("Break down complex documents into smaller sections")
+        
+        return analytics
+
+# app/services/learning_analytics.py
+from typing import Dict, List, Optional
+from datetime import datetime, timedelta
+import numpy as np
+from collections import defaultdict
+import logging
+
+logger = logging.getLogger(__name__)
+
+class LearningAnalytics:
+    """Advanced analytics for learning behavior and performance optimization"""
+    
+    def __init__(self):
+        self.reading_speed_avg = 200  # words per minute baseline
+        self.attention_span_threshold = 1800  # 30 minutes in seconds
+    
+    def analyze_reading_behavior(self, reading_sessions: List[Dict]) -> Dict:
+        """Analyze reading patterns to optimize scheduling"""
+        if not reading_sessions:
+            return {}
+        
+        analysis = {
+            'total_sessions': len(reading_sessions),
+            'total_reading_time': sum(s.get('duration', 0) for s in reading_sessions),
+            'average_session_length': 0,
+            'reading_speed_wpm': self.reading_speed_avg,
+            'attention_patterns': {},
+            'optimal_session_length': 30,  # minutes
+            'break_recommendations': [],
+            'focus_score': 0.0
+        }
+        
+        # Calculate averages
+        durations = [s.get('duration', 0) for s in reading_sessions if s.get('duration', 0) > 0]
+        if durations:
+            analysis['average_session_length'] = np.mean(durations) / 60  # Convert to minutes
+        
+        # Analyze reading speed
+        words_read = []
+        reading_times = []
+        
+        for session in reading_sessions:
+            if session.get('pages_viewed') and session.get('duration'):
+                # Estimate words read (rough calculation)
+                estimated_words = len(session.get('pages_viewed', [])) * 300  # 300 words per page
+                words_read.append(estimated_words)
+                reading_times.append(session['duration'] / 60)  # minutes
+        
+        if words_read and reading_times:
+            total_words = sum(words_read)
+            total_time = sum(reading_times)
+            analysis['reading_speed_wpm'] = total_words / max(1, total_time)
+        
+        # Analyze attention patterns
+        analysis['attention_patterns'] = self._analyze_attention_patterns(reading_sessions)
+        
+        # Calculate focus score
+        analysis['focus_score'] = self._calculate_focus_score(reading_sessions)
+        
+        # Generate recommendations
+        if analysis['average_session_length'] > 45:
+            analysis['break_recommendations'].append("Consider taking breaks every 30-45 minutes")
+        
+        if analysis['focus_score'] < 0.6:
+            analysis['break_recommendations'].append("Try the Pomodoro technique for better focus")
+        
+        return analysis
+    
+    def _analyze_attention_patterns(self, sessions: List[Dict]) -> Dict:
+        """Identify when user is most focused during study sessions"""
+        time_of_day_performance = defaultdict(list)
+        session_length_performance = defaultdict(list)
+        
+        for session in sessions:
+            if not session.get('start_time') or not session.get('duration'):
+                continue
+            
+            # Categorize by time of day
+            start_time = session['start_time']
+            if isinstance(start_time, str):
+                start_time = datetime.fromisoformat(start_time)
+            
+            hour = start_time.hour
+            if 6 <= hour < 12:
+                time_slot = 'morning'
+            elif 12 <= hour < 17:
+                time_slot = 'afternoon'
+            else:
+                time_slot = 'evening'
+            
+            # Calculate performance indicator (reading speed, completion rate)
+            performance = self._calculate_session_performance(session)
+            time_of_day_performance[time_slot].append(performance)
+            
+            # Categorize by session length
+            duration_minutes = session['duration'] / 60
+            if duration_minutes < 20:
+                length_category = 'short'
+            elif duration_minutes < 60:
+                length_category = 'medium'
+            else:
+                length_category = 'long'
+            
+            session_length_performance[length_category].append(performance)
+        
+        # Calculate averages
+        attention_patterns = {}
+        for time_slot, performances in time_of_day_performance.items():
+            attention_patterns[f'{time_slot}_performance'] = np.mean(performances) if performances else 0.0
+        
+        for length_cat, performances in session_length_performance.items():
+            attention_patterns[f'{length_cat}_session_performance'] = np.mean(performances) if performances else 0.0
+        
+        return attention_patterns
+    
+    def _calculate_session_performance(self, session: Dict) -> float:
+        """Calculate a performance score for a reading session"""
+        base_score = 0.5
+        
+        # Factor in reading consistency (less pausing = higher score)
+        pause_points = session.get('pause_points', [])
+        if session.get('duration', 0) > 0:
+            pause_frequency = len(pause_points) / (session['duration'] / 60)  # pauses per minute
+            pause_penalty = min(0.3, pause_frequency * 0.1)
+            base_score -= pause_penalty
+        
+        # Factor in scroll depth (deeper reading = higher score)
+        scroll_depth = session.get('scroll_depth', 0.5)
+        base_score += scroll_depth * 0.3
+        
+        # Factor in session completion
+        if session.get('end_time') and session.get('start_time'):
+            # Session was completed (not abandoned)
+            base_score += 0.2
+        
+        return max(0.0, min(1.0, base_score))
+    
+    def _calculate_focus_score(self, sessions: List[Dict]) -> float:
+        """Calculate overall focus score based on session patterns"""
+        if not sessions:
+            return 0.5
+        
+        focus_indicators = []
+        
+        for session in sessions:
+            duration = session.get('duration', 0)
+            if duration == 0:
+                continue
+            
+            # Longer, uninterrupted sessions indicate better focus
+            duration_score = min(1.0, duration / 2700)  # 45 minutes = 1.0
+            
+            # Fewer pause points indicate better focus
+            pause_points = len(session.get('pause_points', []))
+            pause_score = max(0.0, 1.0 - (pause_points / 10))  # 10 pauses = 0.0
+            
+            # Higher scroll depth indicates engagement
+            scroll_score = session.get('scroll_depth', 0.5)
+            
+            session_focus = (duration_score * 0.4 + pause_score * 0.3 + scroll_score * 0.3)
+            focus_indicators.append(session_focus)
+        
+        return np.mean(focus_indicators) if focus_indicators else 0.5
+    
+    def predict_optimal_study_time(self, user_analytics: Dict, document_difficulty: float) -> Dict:
+        """Predict the optimal study duration for a document"""
+        
+        # Base time estimation
+        base_time = 30  # minutes
+        
+        # Adjust for document difficulty
+        difficulty_multiplier = 0.5 + (document_difficulty * 1.5)
+        adjusted_time = base_time * difficulty_multiplier
+        
+        # Adjust based on user's attention patterns
+        attention_patterns = user_analytics.get('attention_patterns', {})
+        focus_score = user_analytics.get('focus_score', 0.5)
+        
+        # Users with lower focus scores need shorter sessions
+        if focus_score < 0.4:
+            adjusted_time *= 0.7
+        elif focus_score > 0.8:
+            adjusted_time *= 1.3
+        
+        # Consider user's optimal session length
+        avg_session_length = user_analytics.get('average_session_length', 30)
+        if avg_session_length > 0:
+            # Blend predicted time with user's natural session length
+            adjusted_time = (adjusted_time * 0.6) + (avg_session_length * 0.4)
+        
+        # Ensure reasonable bounds
+        adjusted_time = max(10, min(90, adjusted_time))
+        
+        return {
+            'recommended_duration': int(adjusted_time),
+            'confidence_level': min(1.0, focus_score + 0.3),
+            'should_use_breaks': adjusted_time > 45,
+            'break_frequency': 25 if adjusted_time > 45 else None  # Pomodoro-style
+        }
+    
+    def generate_learning_insights(self, 
+                                 user_progress: List[Dict], 
+                                 quiz_attempts: List[Dict],
+                                 reading_sessions: List[Dict]) -> Dict:
+        """Generate comprehensive learning insights and recommendations"""
+        
+        insights = {
+            'learning_velocity': 0.0,
+            'retention_trend': 'stable',
+            'difficulty_adaptation': 'appropriate',
+            'time_efficiency': 0.0,
+            'strengths': [],
+            'areas_for_improvement': [],
+            'personalized_recommendations': []
+        }
+        
+        # Calculate learning velocity (improvement rate)
+        if quiz_attempts:
+            recent_scores = [q['score'] for q in quiz_attempts[-10:]]  # Last 10 attempts
+            older_scores = [q['score'] for q in quiz_attempts[:-10]] if len(quiz_attempts) > 10 else []
+            
+            if older_scores and recent_scores:
+                velocity = np.mean(recent_scores) - np.mean(older_scores)
+                insights['learning_velocity'] = velocity
+                
+                if velocity > 0.1:
+                    insights['retention_trend'] = 'improving'
+                    insights['strengths'].append('Consistent improvement in quiz performance')
+                elif velocity < -0.1:
+                    insights['retention_trend'] = 'declining'
+                    insights['areas_for_improvement'].append('Recent quiz scores are declining')
+        
+        # Analyze time efficiency
+        if reading_sessions and quiz_attempts:
+            total_study_time = sum(s.get('duration', 0) for s in reading_sessions) / 3600  # hours
+            avg_quiz_score = np.mean([q.get('score', 0) for q in quiz_attempts])
+            
+            if total_study_time > 0:
+                insights['time_efficiency'] = avg_quiz_score / total_study_time
+                
+                if insights['time_efficiency'] > 0.2:
+                    insights['strengths'].append('Efficient learning - good results per time invested')
+                elif insights['time_efficiency'] < 0.1:
+                    insights['areas_for_improvement'].append('Consider more active learning techniques')
+        
+        # Generate personalized recommendations
+        reading_behavior = self.analyze_reading_behavior(reading_sessions)
+        
+        if reading_behavior.get('focus_score', 0.5) < 0.6:
+            insights['personalized_recommendations'].append(
+                "Try shorter, more focused study sessions with regular breaks"
+            )
+        
+        if insights['learning_velocity'] < 0:
+            insights['personalized_recommendations'].append(
+                "Review previously studied material more frequently"
+            )
+        
+        if reading_behavior.get('average_session_length', 30) > 60:
+            insights['personalized_recommendations'].append(
+                "Break long study sessions into smaller chunks for better retention"
+            )
+        
+        # Difficulty adaptation analysis
+        difficulty_scores = [p.get('difficulty_rating', 0.5) for p in user_progress]
+        quiz_performance = [q.get('score', 0) for q in quiz_attempts]
+        
+        if difficulty_scores and quiz_performance:
+            # Check if user is consistently scoring well on difficult material
+            high_diff_indices = [i for i, d in enumerate(difficulty_scores) if d > 0.7]
+            if high_diff_indices:
+                high_diff_scores = [quiz_performance[i] for i in high_diff_indices if i < len(quiz_performance)]
+                if high_diff_scores and np.mean(high_diff_scores) > 0.8:
+                    insights['difficulty_adaptation'] = 'ready_for_harder'
+                    insights['personalized_recommendations'].append(
+                        "You're performing well on difficult material - consider challenging yourself more"
+                    )
+            
+            # Check if user is struggling with current difficulty
+            if np.mean(quiz_performance[-5:]) < 0.6:  # Last 5 quizzes
+                insights['difficulty_adaptation'] = 'reduce_difficulty'
+                insights['personalized_recommendations'].append(
+                    "Focus on mastering easier concepts before moving to harder material"
+                )
+        
+        return insights
+
+# app/services/ml_service.py
+"""Main ML service that orchestrates all ML/NLP components"""
+
+import asyncio
+from typing import Dict, List, Optional
+from sqlalchemy.orm import Session
+from datetime import datetime, timedelta
+import logging
+
+from .document_processor import DocumentProcessor
+from .quiz_generator import QuizGenerator
+from .spaced_repetition import SpacedRepetitionScheduler, ReviewData
+from .learning_analytics import LearningAnalytics
+from app.models import Document, Quiz, QuizQuestion, UserProgress, Schedule, ReadingSession
+
+logger = logging.getLogger(__name__)
+
+class MLService:
+    """Main service that coordinates all ML/NLP functionality"""
+    
+    def __init__(self):
+        self.document_processor = DocumentProcessor()
+        self.quiz_generator = QuizGenerator()
+        self.scheduler = SpacedRepetitionScheduler()
+        self.analytics = LearningAnalytics()
+    
+    async def process_uploaded_document(self, 
+                                      file_path: str, 
+                                      file_type: str, 
+                                      document_id: int,
+                                      db: Session) -> Dict:
+        """Process uploaded document and update database"""
+        try:
+            # Process document
+            processing_result = self.document_processor.process_document(file_path, file_type)
+            
+            # Update document in database
+            document = db.query(Document).filter(Document.id == document_id).first()
+            if document:
+                document.extracted_text = processing_result['extracted_text']
+                document.word_count = processing_result['word_count']
+                document.difficulty_score = processing_result['difficulty_score']
+                document.estimated_reading_time = processing_result['estimated_reading_time']
+                document.keywords = processing_result['keywords']
+                document.sections = processing_result['sections']
+                document.processing_status = 'completed'
+                
+                db.commit()
+                
+                logger.info(f"Successfully processed document {document_id}")
+                return {
+                    'success': True,
+                    'document_id': document_id,
+                    'processing_result': processing_result
+                }
+            else:
+                raise ValueError(f"Document {document_id} not found")
+                
+        except Exception as e:
+            # Update document status to failed
+            document = db.query(Document).filter(Document.id == document_id).first()
+            if document:
+                document.processing_status = 'failed'
+                db.commit()
+            
+            logger.error(f"Error processing document {document_id}: {e}")
+            return {
+                'success': False,
+                'error': str(e),
+                'document_id': document_id
+            }
+    
+    async def generate_quiz_for_document(self, 
+                                       document_id: int, 
+                                       num_questions: int,
+                                       db: Session) -> Dict:
+        """Generate quiz for a document"""
+        try:
+            # Get document
+            document = db.query(Document).filter(Document.id == document_id).first()
+            if not document or not document.extracted_text:
+                raise ValueError("Document not found or not processed")
+            
+            # Generate quiz
+            quiz_data = self.quiz_generator.generate_quiz(
+                document.extracted_text, 
+                num_questions
+            )
+            
+            # Create quiz in database
+            quiz = Quiz(
+                document_id=document_id,
+                title=f"Quiz: {document.title}",
+                description=f"Auto-generated quiz with {len(quiz_data['questions'])} questions",
+                total_questions=quiz_data['total_questions'],
+                estimated_duration=quiz_data['estimated_duration'],
+                difficulty_level=quiz_data['difficulty_level']
+            )
+            
+            db.add(quiz)
+            db.flush()  # Get quiz ID
+            
+            # Add questions
+            for i, question_data in enumerate(quiz_data['questions']):
+                question = QuizQuestion(
+                    quiz_id=quiz.id,
+                    question_text=question_data['question_text'],
+                    question_type=question_data['question_type'],
+                    options=question_data['options'],
+                    correct_answer=question_data['correct_answer'],
+                    explanation=question_data['explanation'],
+                    difficulty=question_data['difficulty'],
+                    source_section=question_data['source_section'],
+                    order_index=i
+                )
+                db.add(question)
+            
+            db.commit()
+            
+            logger.info(f"Generated quiz {quiz.id} for document {document_id}")
+            return {
+                'success': True,
+                'quiz_id': quiz.id,
+                'total_questions': quiz.total_questions,
+                'difficulty_level': quiz.difficulty_level
+            }
+            
+        except Exception as e:
+            logger.error(f"Error generating quiz for document {document_id}: {e}")
+            return {
+                'success': False,
+                'error': str(e)
+            }
+    
+    async def update_schedule_after_quiz(self,
+                                       user_id: int,
+                                       document_id: int,
+                                       quiz_score: float,
+                                       time_spent: int,
+                                       difficulty_rating: Optional[float],
+                                       db: Session) -> Dict:
+        """Update spaced repetition schedule after quiz completion"""
+        try:
+            # Get or create user progress
+            progress = db.query(UserProgress).filter(
+                UserProgress.user_id == user_id,
+                UserProgress.document_id == document_id
+            ).first()
+            
+            if not progress:
+                progress = UserProgress(user_id=user_id, document_id=document_id)
+                db.add(progress)
+            
+            # Update reading metrics
+            progress.total_reading_time += session_data.get('duration', 0)
+            progress.last_accessed = datetime.now()
+            
+            # Calculate completion percentage based on pages viewed
+            if session_data.get('pages_viewed'):
+                # Simple estimation - could be improved with actual document structure
+                estimated_total_pages = max(10, len(session_data['pages_viewed']) * 2)
+                unique_pages = len(set(session_data['pages_viewed']))
+                progress.completion_percentage = min(1.0, unique_pages / estimated_total_pages)
+            
+            # Update reading speed if available
+            if session_data.get('reading_speed', 0) > 0:
+                progress.reading_speed = session_data['reading_speed']
+            
+            db.commit()
+            
+            return {
+                'success': True,
+                'session_id': reading_session.id,
+                'updated_progress': {
+                    'total_reading_time': progress.total_reading_time,
+                    'completion_percentage': progress.completion_percentage
+                }
+            }
+            
+        except Exception as e:
+            logger.error(f"Error tracking reading session: {e}")
+            return {
+                'success': False,
+                'error': str(e)
+            }
+    
+    async def get_user_analytics(self, user_id: int, db: Session) -> Dict:
+        """Get comprehensive analytics for a user"""
+        try:
+            # Get user's progress data
+            progress_data = db.query(UserProgress).filter(
+                UserProgress.user_id == user_id
+            ).all()
+            
+            # Get reading sessions
+            reading_sessions = db.query(ReadingSession).filter(
+                ReadingSession.user_id == user_id
+            ).order_by(ReadingSession.start_time.desc()).limit(50).all()
+            
+            # Get quiz attempts (would need to add this relationship)
+            # For now, we'll simulate this from user progress
+            quiz_attempts = []
+            for progress in progress_data:
+                if progress.last_quiz_score > 0:
+                    quiz_attempts.append({
+                        'score': progress.last_quiz_score,
+                        'timestamp': progress.last_quiz_attempt,
+                        'document_id': progress.document_id
+                    })
+            
+            # Convert to dictionaries for analytics processing
+            progress_dicts = [
+                {
+                    'document_id': p.document_id,
+                    'retention_rate': p.retention_rate,
+                    'difficulty_rating': p.difficulty_rating or 0.5,
+                    'average_quiz_score': p.average_quiz_score,
+                    'total_reading_time': p.total_reading_time,
+                    'completion_percentage': p.completion_percentage,
+                    'familiarity_score': p.familiarity_score
+                }
+                for p in progress_data
+            ]
+            
+            session_dicts = [
+                {
+                    'start_time': s.start_time,
+                    'duration': s.duration,
+                    'pages_viewed': s.pages_viewed or [],
+                    'scroll_depth': s.scroll_depth,
+                    'pause_points': s.pause_points or [],
+                    'reading_speed': s.reading_speed
+                }
+                for s in reading_sessions
+            ]
+            
+            # Generate analytics
+            reading_behavior = self.analytics.analyze_reading_behavior(session_dicts)
+            performance_analytics = self.scheduler.get_performance_analytics(progress_dicts)
+            learning_insights = self.analytics.generate_learning_insights(
+                progress_dicts, quiz_attempts, session_dicts
+            )
+            
+            return {
+                'success': True,
+                'analytics': {
+                    'reading_behavior': reading_behavior,
+                    'performance': performance_analytics,
+                    'insights': learning_insights,
+                    'summary': {
+                        'total_documents': len(progress_data),
+                        'total_study_time': sum(p.total_reading_time for p in progress_data),
+                        'average_retention': performance_analytics.get('avg_retention_rate', 0.0),
+                        'learning_efficiency': learning_insights.get('time_efficiency', 0.0)
+                    }
+                }
+            }
+            
+        except Exception as e:
+            logger.error(f"Error getting user analytics: {e}")
+            return {
+                'success': False,
+                'error': str(e)
+            }
+    
+    async def get_study_recommendations(self, user_id: int, db: Session) -> Dict:
+        """Get personalized study recommendations"""
+        try:
+            # Get user analytics
+            analytics_result = await self.get_user_analytics(user_id, db)
+            if not analytics_result['success']:
+                return analytics_result
+            
+            analytics = analytics_result['analytics']
+            
+            recommendations = {
+                'immediate_actions': [],
+                'study_strategy': [],
+                'schedule_optimization': [],
+                'difficulty_adjustments': []
+            }
+            
+            # Analyze reading behavior for recommendations
+            reading_behavior = analytics['reading_behavior']
+            
+            if reading_behavior.get('focus_score', 0.5) < 0.6:
+                recommendations['immediate_actions'].append(
+                    "Try shorter study sessions (20-30 minutes) with 5-minute breaks"
+                )
+            
+            if reading_behavior.get('average_session_length', 30) > 60:
+                recommendations['study_strategy'].append(
+                    "Break long study sessions into multiple shorter ones for better retention"
+                )
+            
+            # Analyze performance for recommendations
+            performance = analytics['performance']
+            
+            if performance.get('avg_retention_rate', 0.5) < 0.6:
+                recommendations['schedule_optimization'].append(
+                    "Increase review frequency - schedule reviews every 2-3 days instead of weekly"
+                )
+            
+            # Analyze learning insights
+            insights = analytics['insights']
+            
+            if insights.get('learning_velocity', 0) < 0:
+                recommendations['difficulty_adjustments'].append(
+                    "Consider reviewing easier material before tackling new concepts"
+                )
+            
+            if insights.get('time_efficiency', 0) < 0.1:
+                recommendations['study_strategy'].extend([
+                    "Use active recall techniques - quiz yourself without looking at answers",
+                    "Try the Feynman technique - explain concepts in simple terms"
+                ])
+            
+            # Get optimal study times based on attention patterns
+            attention_patterns = reading_behavior.get('attention_patterns', {})
+            best_time_slot = 'morning'  # default
+            
+            morning_perf = attention_patterns.get('morning_performance', 0.5)
+            afternoon_perf = attention_patterns.get('afternoon_performance', 0.5)
+            evening_perf = attention_patterns.get('evening_performance', 0.5)
+            
+            if afternoon_perf > morning_perf and afternoon_perf > evening_perf:
+                best_time_slot = 'afternoon'
+            elif evening_perf > morning_perf and evening_perf > afternoon_perf:
+                best_time_slot = 'evening'
+            
+            recommendations['schedule_optimization'].append(
+                f"Your peak performance time appears to be {best_time_slot} - schedule difficult topics then"
+            )
+            
+            return {
+                'success': True,
+                'recommendations': recommendations,
+                'confidence_score': min(1.0, len(analytics['reading_behavior']) * 0.1 + 0.5),
+                'based_on_sessions': len(reading_behavior.get('total_sessions', 0))
+            }
+            
+        except Exception as e:
+            logger.error(f"Error generating study recommendations: {e}")
+            return {
+                'success': False,
+                'error': str(e)
+            }
+
+# Usage example and configuration
+class MLServiceConfig:
+    """Configuration for ML services"""
+    
+    # Document processing settings
+    MAX_FILE_SIZE_MB = 50
+    SUPPORTED_FILE_TYPES = ['pdf', 'png', 'jpg', 'jpeg']
+    
+    # Quiz generation settings
+    DEFAULT_QUIZ_QUESTIONS = 10
+    MAX_QUIZ_QUESTIONS = 25
+    MIN_QUIZ_QUESTIONS = 5
+    
+    # Spaced repetition settings
+    TARGET_RETENTION_RATE = 0.85
+    MAX_DAILY_REVIEWS = 20
+    COGNITIVE_LOAD_THRESHOLD = 0.8
+    
+    # Analytics settings
+    MIN_SESSIONS_FOR_INSIGHTS = 5
+    ANALYTICS_LOOKBACK_DAYS = 30
+
+# Initialize ML service instance (singleton pattern)
+ml_service = MLService()
+
+# Example FastAPI endpoint integration
+"""
+# In your FastAPI routes file (e.g., app/routes/documents.py)
+
+from app.services.ml_service import ml_service
+
+@router.post("/documents/{document_id}/process")
+async def process_document(
+    document_id: int,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    # Add document processing to background tasks
+    background_tasks.add_task(
+        ml_service.process_uploaded_document,
+        file_path=f"uploads/{document_id}",
+        file_type="pdf",  # Get from document record
+        document_id=document_id,
+        db=db
+    )
+    return {"message": "Document processing started"}
+
+@router.post("/documents/{document_id}/quiz")
+async def generate_quiz(
+    document_id: int,
+    num_questions: int = 10,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    result = await ml_service.generate_quiz_for_document(
+        document_id=document_id,
+        num_questions=num_questions,
+        db=db
+    )
+    return result
+
+@router.get("/schedule/today")
+async def get_daily_schedule(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    result = await ml_service.generate_daily_schedule(
+        user_id=current_user.id,
+        db=db
+    )
+    return result
+
+@router.post("/analytics/reading-session")
+async def track_reading(
+    session_data: dict,
+    document_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    result = await ml_service.track_reading_session(
+        user_id=current_user.id,
+        document_id=document_id,
+        session_data=session_data,
+        db=db
+    )
+    return result
+
+@router.get("/analytics/insights")
+async def get_learning_insights(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    result = await ml_service.get_user_analytics(
+        user_id=current_user.id,
+        db=db
+    )
+    return result
+
+@router.get("/recommendations")
+async def get_recommendations(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    result = await ml_service.get_study_recommendations(
+        user_id=current_user.id,
+        db=db
+    )
+    return result
+"""(
+                UserProgress.user_id == user_id,
+                UserProgress.document_id == document_id
+            ).first()
+            
+            if not progress:
+                progress = UserProgress(user_id=user_id, document_id=document_id)
+                db.add(progress)
+                db.flush()
+            
+            # Update progress metrics
+            progress.quiz_attempts_count += 1
+            progress.last_quiz_score = quiz_score
+            progress.average_quiz_score = (
+                (progress.average_quiz_score * (progress.quiz_attempts_count - 1) + quiz_score) /
+                progress.quiz_attempts_count
+            )
+            progress.best_quiz_score = max(progress.best_quiz_score, quiz_score)
+            progress.last_quiz_attempt = datetime.now()
+            
+            if difficulty_rating:
+                progress.difficulty_rating = difficulty_rating
+            
+            # Get or create schedule
+            schedule = db.query(Schedule).filter(
+                Schedule.user_id == user_id,
+                Schedule.document_id == document_id
+            ).first()
+            
+            if not schedule:
+                schedule = Schedule(
+                    user_id=user_id,
+                    document_id=document_id,
+                    scheduled_date=datetime.now() + timedelta(days=1)
+                )
+                db.add(schedule)
+                db.flush()
+            
+            # Prepare review data
+            review_data = ReviewData(
+                performance_score=quiz_score,
+                response_time=time_spent,
+                difficulty_rating=difficulty_rating,
+                timestamp=datetime.now()
+            )
+            
+            # Get current schedule data
+            current_schedule_data = {
+                'strength': schedule.strength,
+                'half_life': schedule.half_life,
+                'last_review_date': schedule.last_review_date,
+                'difficulty_score': progress.difficulty_rating or 0.5,
+                'repetition_number': schedule.repetition_number
+            }
+            
+            # Update schedule using spaced repetition algorithm
+            updated_schedule = self.scheduler.update_schedule_after_review(
+                current_schedule_data, review_data
+            )
+            
+            # Update schedule in database
+            schedule.strength = updated_schedule['strength']
+            schedule.half_life = updated_schedule['half_life']
+            schedule.scheduled_date = updated_schedule['next_review_date']
+            schedule.last_review_date = updated_schedule['last_review_date']
+            schedule.repetition_number = updated_schedule['repetition_number']
+            schedule.cognitive_load_score = updated_schedule['cognitive_load_score']
+            schedule.last_performance = quiz_score
+            schedule.status = 'completed'
+            
+            # Update user progress with algorithm results
+            progress.familiarity_score = updated_schedule['strength']
+            progress.retention_rate = updated_schedule['retention_probability']
+            
+            db.commit()
+            
+            logger.info(f"Updated schedule for user {user_id}, document {document_id}")
+            return {
+                'success': True,
+                'next_review_date': updated_schedule['next_review_date'],
+                'retention_probability': updated_schedule['retention_probability'],
+                'strength': updated_schedule['strength']
+            }
+            
+        except Exception as e:
+            logger.error(f"Error updating schedule: {e}")
+            return {
+                'success': False,
+                'error': str(e)
+            }
+    
+    async def generate_daily_schedule(self, user_id: int, db: Session) -> Dict:
+        """Generate daily study schedule for user"""
+        try:
+            # Get user's documents with progress and schedule data
+            user_documents = []
+            
+            documents = db.query(Document).filter(Document.user_id == user_id).all()
+            
+            for doc in documents:
+                progress = db.query(UserProgress).filter(
+                    UserProgress.user_id == user_id,
+                    UserProgress.document_id == doc.id
+                ).first()
+                
+                schedule = db.query(Schedule).filter(
+                    Schedule.user_id == user_id,
+                    Schedule.document_id == doc.id
+                ).first()
+                
+                doc_data = {
+                    'id': doc.id,
+                    'title': doc.title,
+                    'difficulty_score': doc.difficulty_score,
+                    'estimated_reading_time': doc.estimated_reading_time,
+                    'schedule_data': {}
+                }
+                
+                if schedule:
+                    doc_data['schedule_data'] = {
+                        'strength': schedule.strength,
+                        'half_life': schedule.half_life,
+                        'next_review_date': schedule.scheduled_date,
+                        'last_review_date': schedule.last_review_date,
+                        'repetition_number': schedule.repetition_number
+                    }
+                
+                if progress:
+                    doc_data['difficulty_rating'] = progress.difficulty_rating
+                
+                user_documents.append(doc_data)
+            
+            # Generate schedule
+            daily_schedule = self.scheduler.generate_daily_schedule(user_documents)
+            
+            # Create schedule entries in database
+            for item in daily_schedule:
+                # Check if schedule already exists for today
+                today_start = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+                existing_schedule = db.query(Schedule).filter(
+                    Schedule.user_id == user_id,
+                    Schedule.document_id == item['document_id'],
+                    Schedule.scheduled_date >= today_start,
+                    Schedule.status == 'pending'
+                ).first()
+                
+                if not existing_schedule:
+                    new_schedule = Schedule(
+                        user_id=user_id,
+                        document_id=item['document_id'],
+                        scheduled_date=datetime.now(),
+                        priority=item['priority'],
+                        activity_type=item['activity_type'],
+                        estimated_duration=item['estimated_duration'],
+                        cognitive_load_score=item['cognitive_load'],
+                        optimal_time_slot=item['recommended_time_slot'],
+                        status='pending'
+                    )
+                    db.add(new_schedule)
+            
+            db.commit()
+            
+            return {
+                'success': True,
+                'schedule': daily_schedule,
+                'total_items': len(daily_schedule),
+                'estimated_total_time': sum(item['estimated_duration'] for item in daily_schedule)
+            }
+            
+        except Exception as e:
+            logger.error(f"Error generating daily schedule for user {user_id}: {e}")
+            return {
+                'success': False,
+                'error': str(e)
+            }
+    
+    async def track_reading_session(self,
+                                  user_id: int,
+                                  document_id: int,
+                                  session_data: Dict,
+                                  db: Session) -> Dict:
+        """Track and analyze reading session"""
+        try:
+            # Create reading session record
+            reading_session = ReadingSession(
+                user_id=user_id,
+                document_id=document_id,
+                start_time=session_data.get('start_time', datetime.now()),
+                end_time=session_data.get('end_time'),
+                duration=session_data.get('duration', 0),
+                pages_viewed=session_data.get('pages_viewed', []),
+                scroll_depth=session_data.get('scroll_depth', 0.0),
+                reading_speed=session_data.get('reading_speed', 0.0),
+                pause_points=session_data.get('pause_points', []),
+                session_type=session_data.get('session_type', 'study')
+            )
+            
+            db.add(reading_session)
+            
+            # Update user progress
+            progress = db.query(UserProgress).filter

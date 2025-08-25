@@ -6,14 +6,15 @@ import os
 
 from database import engine, Base
 from routers import auth, materials, schedules, quizzes, performance, sessions
+from services.ml_service import MLService
 
 # Create database tables
 Base.metadata.create_all(bind=engine)
 
 app = FastAPI(
     title="Personalized Study Scheduler API",
-    description="FastAPI server for personalized study scheduling with PDF processing and quiz generation",
-    version="1.0.0"
+    description="AI-powered personalized learning and study scheduling platform with ML-driven adaptive algorithms",
+    version="2.0.0"
 )
 
 # Add CORS middleware
@@ -35,7 +36,17 @@ app.include_router(sessions.router, prefix="/sessions", tags=["sessions"])
 
 @app.get("/")
 async def root():
-    return {"message": "Personalized Study Scheduler API", "version": "1.0.0"}
+    return {
+        "message": "Personalized Study Scheduler API", 
+        "version": "2.0.0",
+        "features": [
+            "Half-Life Regression scheduling",
+            "ML-driven quiz generation", 
+            "Advanced learning analytics",
+            "Cognitive load optimization",
+            "Adaptive difficulty progression"
+        ]
+    }
 
 @app.get("/health")
 async def health_check():
