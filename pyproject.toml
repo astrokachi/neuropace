@@ -23,6 +23,3 @@ dependencies = [
     "email-validator",
     "scipy",
 ]
-
-[tool.uv]
-seed-prereleases = true
